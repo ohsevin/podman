@@ -10,6 +10,7 @@ import (
 
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/ioutils"
+	"github.com/containers/storage/pkg/lockfile"
 	"github.com/containers/storage/pkg/stringid"
 	"github.com/containers/storage/pkg/truncindex"
 	digest "github.com/opencontainers/go-digest"
@@ -140,15 +141,21 @@ type rwContainerStore interface {
 }
 
 type containerStore struct {
-	lockfile   Locker
-	dir        string
-	jsonPath   [numContainerLocationIndex]string
+	// The following fields are only set when constructing containerStore, and must never be modified afterwards.
+	// They are safe to access without any other locking.
+	lockfile *lockfile.LockFile // Synchronizes readers vs. writers of the _filesystem data_, both cross-process and in-process.
+	dir      string
+	jsonPath [numContainerLocationIndex]string
+
+	inProcessLock sync.RWMutex // Can _only_ be obtained with lockfile held.
+	// The following fields can only be read/written with read/write ownership of inProcessLock, respectively.
+	// Almost all users should use startReading() or startWriting().
+	lastWrite  lockfile.LastWrite
 	containers []*Container
 	idindex    *truncindex.TruncIndex
 	byid       map[string]*Container
 	bylayer    map[string]*Container
 	byname     map[string]*Container
-	loadMut    sync.Mutex
 }
 
 func copyContainer(c *Container) *Container {
@@ -200,6 +207,7 @@ func (c *Container) MountOpts() []string {
 	}
 }
 
+// The caller must hold r.inProcessLock for reading.
 func containerLocation(c *Container) containerLocations {
 	if c.volatileStore {
 		return volatileContainerLocation
@@ -214,9 +222,11 @@ func containerLocation(c *Container) containerLocations {
 // should use startWriting() instead.
 func (r *containerStore) startWritingWithReload(canReload bool) error {
 	r.lockfile.Lock()
+	r.inProcessLock.Lock()
 	succeeded := false
 	defer func() {
 		if !succeeded {
+			r.inProcessLock.Unlock()
 			r.lockfile.Unlock()
 		}
 	}()
@@ -239,54 +249,114 @@ func (r *containerStore) startWriting() error {
 
 // stopWriting releases locks obtained by startWriting.
 func (r *containerStore) stopWriting() {
+	r.inProcessLock.Unlock()
 	r.lockfile.Unlock()
 }
 
 // startReading makes sure the store is fresh, and locks it for reading.
 // If this succeeds, the caller MUST call stopReading().
 func (r *containerStore) startReading() error {
+	// inProcessLocked calls the nested function with r.inProcessLock held for writing.
+	inProcessLocked := func(fn func() error) error {
+		r.inProcessLock.Lock()
+		defer r.inProcessLock.Unlock()
+		return fn()
+	}
+
 	r.lockfile.RLock()
-	unlockFn := r.lockfile.Unlock // A function to call to clean up, or nil
+	unlockFn := r.lockfile.Unlock // A function to call to clean up, or nil.
 	defer func() {
 		if unlockFn != nil {
 			unlockFn()
 		}
 	}()
+	r.inProcessLock.RLock()
+	unlockFn = r.stopReading
 
-	if tryLockedForWriting, err := r.reloadIfChanged(false); err != nil {
-		if !tryLockedForWriting {
-			return err
-		}
-		unlockFn()
-		unlockFn = nil
-
-		r.lockfile.Lock()
-		unlockFn = r.lockfile.Unlock
-		if _, err := r.load(true); err != nil {
-			return err
-		}
-		unlockFn()
-		unlockFn = nil
-
-		r.lockfile.RLock()
-		unlockFn = r.lockfile.Unlock
-		// We need to check for a reload reload once more because the on-disk state could have been modified
-		// after we released the lock.
-		// If that, _again_, finds inconsistent state, just give up.
-		// We could, plausibly, retry a few times, but that inconsistent state (duplicate container names)
-		// shouldn’t be saved (by correct implementations) in the first place.
-		if _, err := r.reloadIfChanged(false); err != nil {
-			return fmt.Errorf("(even after successfully cleaning up once:) %w", err)
-		}
+	// If we are lucky, we can just hold the read locks, check that we are fresh, and continue.
+	_, modified, err := r.modified()
+	if err != nil {
+		return err
 	}
+	if modified {
+		// We are unlucky, and need to reload.
+		// NOTE: Multiple goroutines can get to this place approximately simultaneously.
+		r.inProcessLock.RUnlock()
+		unlockFn = r.lockfile.Unlock
 
+		// r.lastWrite can change at this point if another goroutine reloads the store before us. That’s why we don’t unconditionally
+		// trigger a load below; we (lock and) reloadIfChanged() again.
+
+		// First try reloading with r.lockfile held for reading.
+		// r.inProcessLock will serialize all goroutines that got here;
+		// each will re-check on-disk state vs. r.lastWrite, and the first one will actually reload the data.
+		var tryLockedForWriting bool
+		if err := inProcessLocked(func() error {
+			// We could optimize this further: The r.lockfile.GetLastWrite() value shouldn’t change as long as we hold r.lockfile,
+			// so if r.lastWrite was already updated, we don’t need to actually read the on-filesystem lock.
+			var err error
+			tryLockedForWriting, err = r.reloadIfChanged(false)
+			return err
+		}); err != nil {
+			if !tryLockedForWriting {
+				return err
+			}
+			// Not good enough, we need r.lockfile held for writing. So, let’s do that.
+			unlockFn()
+			unlockFn = nil
+
+			r.lockfile.Lock()
+			unlockFn = r.lockfile.Unlock
+			if err := inProcessLocked(func() error {
+				_, err := r.reloadIfChanged(true)
+				return err
+			}); err != nil {
+				return err
+			}
+			unlockFn()
+			unlockFn = nil
+
+			r.lockfile.RLock()
+			unlockFn = r.lockfile.Unlock
+			// We need to check for a reload once more because the on-disk state could have been modified
+			// after we released the lock.
+			// If that, _again_, finds inconsistent state, just give up.
+			// We could, plausibly, retry a few times, but that inconsistent state (duplicate container names)
+			// shouldn’t be saved (by correct implementations) in the first place.
+			if err := inProcessLocked(func() error {
+				_, err := r.reloadIfChanged(false)
+				return err
+			}); err != nil {
+				return fmt.Errorf("(even after successfully cleaning up once:) %w", err)
+			}
+		}
+
+		// NOTE that we hold neither a read nor write inProcessLock at this point. That’s fine in ordinary operation, because
+		// the on-filesystem r.lockfile should protect us against (cooperating) writers, and any use of r.inProcessLock
+		// protects us against in-process writers modifying data.
+		// In presence of non-cooperating writers, we just ensure that 1) the in-memory data is not clearly out-of-date
+		// and 2) access to the in-memory data is not racy;
+		// but we can’t protect against those out-of-process writers modifying _files_ while we are assuming they are in a consistent state.
+
+		r.inProcessLock.RLock()
+	}
 	unlockFn = nil
 	return nil
 }
 
 // stopReading releases locks obtained by startReading.
 func (r *containerStore) stopReading() {
+	r.inProcessLock.RUnlock()
 	r.lockfile.Unlock()
+}
+
+// modified returns true if the on-disk state has changed (i.e. if reloadIfChanged may need to modify the store),
+// and a lockfile.LastWrite value for that update.
+//
+// The caller must hold r.lockfile for reading _or_ writing.
+// The caller must hold r.inProcessLock for reading or writing.
+func (r *containerStore) modified() (lockfile.LastWrite, bool, error) {
+	return r.lockfile.ModifiedSince(r.lastWrite)
 }
 
 // reloadIfChanged reloads the contents of the store from disk if it is changed.
@@ -294,24 +364,30 @@ func (r *containerStore) stopReading() {
 // The caller must hold r.lockfile for reading _or_ writing; lockedForWriting is true
 // if it is held for writing.
 //
+// The caller must hold r.inProcessLock for WRITING.
+//
 // If !lockedForWriting and this function fails, the return value indicates whether
-// load() with lockedForWriting could succeed. In that case the caller MUST
-// call load(), not reloadIfChanged() (because the “if changed” state will not
-// be detected again).
+// reloadIfChanged() with lockedForWriting could succeed.
 func (r *containerStore) reloadIfChanged(lockedForWriting bool) (bool, error) {
-	r.loadMut.Lock()
-	defer r.loadMut.Unlock()
-
-	modified, err := r.lockfile.Modified()
+	lastWrite, modified, err := r.modified()
 	if err != nil {
 		return false, err
 	}
+	// We require callers to always hold r.inProcessLock for WRITING, even if they might not end up calling r.load()
+	// and modify no fields, to ensure they see fresh data:
+	// r.lockfile.Modified() only returns true once per change.  Without an exclusive lock,
+	// one goroutine might see r.lockfile.Modified() == true and decide to load, and in the meanwhile another one could
+	// see r.lockfile.Modified() == false and proceed to use in-memory data without noticing it is stale.
 	if modified {
-		return r.load(lockedForWriting)
+		if tryLockedForWriting, err := r.load(lockedForWriting); err != nil {
+			return tryLockedForWriting, err // r.lastWrite is unchanged, so we will load the next time again.
+		}
+		r.lastWrite = lastWrite
 	}
 	return false, nil
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) Containers() ([]Container, error) {
 	containers := make([]Container, len(r.containers))
 	for i := range r.containers {
@@ -323,6 +399,7 @@ func (r *containerStore) Containers() ([]Container, error) {
 // This looks for datadirs in the store directory that are not referenced
 // by the json file and removes it. These can happen in the case of unclean
 // shutdowns or regular restarts in transient store mode.
+// Requires startReading.
 func (r *containerStore) GarbageCollect() error {
 	entries, err := os.ReadDir(r.dir)
 	if err != nil {
@@ -363,8 +440,12 @@ func (r *containerStore) datapath(id, key string) string {
 
 // load reloads the contents of the store from disk.
 //
+// Most callers should call reloadIfChanged() instead, to avoid overhead and to correctly
+// manage r.lastWrite.
+//
 // The caller must hold r.lockfile for reading _or_ writing; lockedForWriting is true
 // if it is held for writing.
+// The caller must hold r.inProcessLock for WRITING.
 //
 // If !lockedForWriting and this function fails, the return value indicates whether
 // retrying with lockedForWriting could succeed.
@@ -435,8 +516,9 @@ func (r *containerStore) load(lockedForWriting bool) (bool, error) {
 	return false, nil
 }
 
-// Save saves the contents of the store to disk.  It should be called with
-// the lock held, locked for writing.
+// save saves the contents of the store to disk.
+// The caller must hold r.lockfile locked for writing.
+// The caller must hold r.inProcessLock for reading (but usually holds it for writing in order to make the desired changes).
 func (r *containerStore) save(saveLocations containerLocations) error {
 	r.lockfile.AssertLockedForWriting()
 	for locationIndex := 0; locationIndex < numContainerLocationIndex; locationIndex++ {
@@ -469,9 +551,17 @@ func (r *containerStore) save(saveLocations containerLocations) error {
 			return err
 		}
 	}
-	return r.lockfile.Touch()
+	lw, err := r.lockfile.RecordWrite()
+	if err != nil {
+		return err
+	}
+	r.lastWrite = lw
+	return nil
 }
 
+// saveFor saves the contents of the store relevant for modifiedContainer to disk.
+// The caller must hold r.lockfile locked for writing.
+// The caller must hold r.inProcessLock for reading (but usually holds it for writing in order to make the desired changes).
 func (r *containerStore) saveFor(modifiedContainer *Container) error {
 	return r.save(containerLocation(modifiedContainer))
 }
@@ -487,24 +577,29 @@ func newContainerStore(dir string, runDir string, transient bool) (rwContainerSt
 		}
 		volatileDir = runDir
 	}
-	lockfile, err := GetLockfile(filepath.Join(volatileDir, "containers.lock"))
+	lockfile, err := lockfile.GetLockFile(filepath.Join(volatileDir, "containers.lock"))
 	if err != nil {
 		return nil, err
 	}
 	cstore := containerStore{
-		lockfile:   lockfile,
-		dir:        dir,
-		containers: []*Container{},
-		byid:       make(map[string]*Container),
-		bylayer:    make(map[string]*Container),
-		byname:     make(map[string]*Container),
+		lockfile: lockfile,
+		dir:      dir,
 		jsonPath: [numContainerLocationIndex]string{
 			filepath.Join(dir, "containers.json"),
 			filepath.Join(volatileDir, "volatile-containers.json"),
 		},
+
+		containers: []*Container{},
+		byid:       make(map[string]*Container),
+		bylayer:    make(map[string]*Container),
+		byname:     make(map[string]*Container),
 	}
 
 	if err := cstore.startWritingWithReload(false); err != nil {
+		return nil, err
+	}
+	cstore.lastWrite, err = cstore.lockfile.GetLastWrite()
+	if err != nil {
 		return nil, err
 	}
 	defer cstore.stopWriting()
@@ -514,6 +609,7 @@ func newContainerStore(dir string, runDir string, transient bool) (rwContainerSt
 	return &cstore, nil
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) lookup(id string) (*Container, bool) {
 	if container, ok := r.byid[id]; ok {
 		return container, ok
@@ -529,6 +625,7 @@ func (r *containerStore) lookup(id string) (*Container, bool) {
 	return nil, false
 }
 
+// Requires startWriting.
 func (r *containerStore) ClearFlag(id string, flag string) error {
 	container, ok := r.lookup(id)
 	if !ok {
@@ -538,6 +635,7 @@ func (r *containerStore) ClearFlag(id string, flag string) error {
 	return r.saveFor(container)
 }
 
+// Requires startWriting.
 func (r *containerStore) SetFlag(id string, flag string, value interface{}) error {
 	container, ok := r.lookup(id)
 	if !ok {
@@ -550,6 +648,7 @@ func (r *containerStore) SetFlag(id string, flag string, value interface{}) erro
 	return r.saveFor(container)
 }
 
+// Requires startWriting.
 func (r *containerStore) Create(id string, names []string, image, layer, metadata string, options *ContainerOptions) (container *Container, err error) {
 	if id == "" {
 		id = stringid.GenerateRandomID()
@@ -609,6 +708,7 @@ func (r *containerStore) Create(id string, names []string, image, layer, metadat
 	return container, err
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) Metadata(id string) (string, error) {
 	if container, ok := r.lookup(id); ok {
 		return container.Metadata, nil
@@ -616,6 +716,7 @@ func (r *containerStore) Metadata(id string) (string, error) {
 	return "", ErrContainerUnknown
 }
 
+// Requires startWriting.
 func (r *containerStore) SetMetadata(id, metadata string) error {
 	if container, ok := r.lookup(id); ok {
 		container.Metadata = metadata
@@ -624,10 +725,12 @@ func (r *containerStore) SetMetadata(id, metadata string) error {
 	return ErrContainerUnknown
 }
 
+// The caller must hold r.inProcessLock for writing.
 func (r *containerStore) removeName(container *Container, name string) {
 	container.Names = stringSliceWithoutValue(container.Names, name)
 }
 
+// Requires startWriting.
 func (r *containerStore) updateNames(id string, names []string, op updateNameOperation) error {
 	container, ok := r.lookup(id)
 	if !ok {
@@ -651,6 +754,7 @@ func (r *containerStore) updateNames(id string, names []string, op updateNameOpe
 	return r.saveFor(container)
 }
 
+// Requires startWriting.
 func (r *containerStore) Delete(id string) error {
 	container, ok := r.lookup(id)
 	if !ok {
@@ -689,6 +793,7 @@ func (r *containerStore) Delete(id string) error {
 	return nil
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) Get(id string) (*Container, error) {
 	if container, ok := r.lookup(id); ok {
 		return copyContainer(container), nil
@@ -696,6 +801,7 @@ func (r *containerStore) Get(id string) (*Container, error) {
 	return nil, ErrContainerUnknown
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) Lookup(name string) (id string, err error) {
 	if container, ok := r.lookup(name); ok {
 		return container.ID, nil
@@ -703,11 +809,13 @@ func (r *containerStore) Lookup(name string) (id string, err error) {
 	return "", ErrContainerUnknown
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) Exists(id string) bool {
 	_, ok := r.lookup(id)
 	return ok
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) BigData(id, key string) ([]byte, error) {
 	if key == "" {
 		return nil, fmt.Errorf("can't retrieve container big data value for empty name: %w", ErrInvalidBigDataName)
@@ -775,6 +883,7 @@ func (r *containerStore) BigDataDigest(id, key string) (digest.Digest, error) {
 	return "", ErrDigestUnknown
 }
 
+// Requires startReading or startWriting.
 func (r *containerStore) BigDataNames(id string) ([]string, error) {
 	c, ok := r.lookup(id)
 	if !ok {
@@ -783,6 +892,7 @@ func (r *containerStore) BigDataNames(id string) ([]string, error) {
 	return copyStringSlice(c.BigDataNames), nil
 }
 
+// Requires startWriting.
 func (r *containerStore) SetBigData(id, key string, data []byte) error {
 	if key == "" {
 		return fmt.Errorf("can't set empty name for container big data item: %w", ErrInvalidBigDataName)
@@ -829,6 +939,7 @@ func (r *containerStore) SetBigData(id, key string, data []byte) error {
 	return err
 }
 
+// Requires startWriting.
 func (r *containerStore) Wipe() error {
 	ids := make([]string, 0, len(r.byid))
 	for id := range r.byid {
