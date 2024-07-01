@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,7 +69,7 @@ func setChildProcess() error {
 
 // Run runs the specified command in the container's root filesystem.
 func (b *Builder) Run(command []string, options RunOptions) error {
-	p, err := ioutil.TempDir("", define.Package)
+	p, err := os.MkdirTemp("", define.Package)
 	if err != nil {
 		return err
 	}
@@ -115,8 +114,10 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 		return err
 	}
 
+	workDir := b.WorkDir()
 	if options.WorkingDir != "" {
 		g.SetProcessCwd(options.WorkingDir)
+		workDir = options.WorkingDir
 	} else if b.WorkDir() != "" {
 		g.SetProcessCwd(b.WorkDir())
 	}
@@ -321,6 +322,7 @@ rootless=%d
 	}
 
 	runMountInfo := runMountInfo{
+		WorkDir:          workDir,
 		ContextDir:       options.ContextDir,
 		Secrets:          options.Secrets,
 		SSHSources:       options.SSHSources,
@@ -480,7 +482,7 @@ func setupRootlessNetwork(pid int) (teardown func(), err error) {
 	defer rootlessSlirpSyncR.Close()
 
 	// Be sure there are no fds inherited to slirp4netns except the sync pipe
-	files, err := ioutil.ReadDir("/proc/self/fd")
+	files, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		return nil, fmt.Errorf("cannot list open fds: %w", err)
 	}
@@ -984,6 +986,7 @@ func setupMaskedPaths(g *generate.Generator) {
 		"/sys/firmware",
 		"/sys/fs/selinux",
 		"/sys/dev",
+		"/sys/devices/virtual/powercap",
 	} {
 		g.AddLinuxMaskedPaths(mp)
 	}
@@ -1199,10 +1202,10 @@ func checkIdsGreaterThan5(ids []spec.LinuxIDMapping) bool {
 	return false
 }
 
-// If this function succeeds and returns a non-nil lockfile.Locker, the caller must unlock it (when??).
-func (b *Builder) getCacheMount(tokens []string, stageMountPoints map[string]internal.StageMountDetails, idMaps IDMaps) (*spec.Mount, lockfile.Locker, error) {
+// If this function succeeds and returns a non-nil *lockfile.LockFile, the caller must unlock it (when??).
+func (b *Builder) getCacheMount(tokens []string, stageMountPoints map[string]internal.StageMountDetails, idMaps IDMaps, workDir string) (*spec.Mount, *lockfile.LockFile, error) {
 	var optionMounts []specs.Mount
-	mount, targetLock, err := internalParse.GetCacheMount(tokens, b.store, b.MountLabel, stageMountPoints)
+	mount, targetLock, err := internalParse.GetCacheMount(tokens, b.store, b.MountLabel, stageMountPoints, workDir)
 	if err != nil {
 		return nil, nil, err
 	}
